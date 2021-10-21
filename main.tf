@@ -19,6 +19,7 @@ sudo systemctl enable docker
 sudo systemctl start docker
 sudo usermod -a -G docker ec2-user
 docker run -p 80:80 --name my-nginx -d nginx
+docker exec my-nginx sed -i "s/to nginx/to $HOSTNAME/" usr/share/nginx/html/index.html
 EOF
 }
 
@@ -39,6 +40,26 @@ module "vpc" {
   tags = var.vpc_tags
 }
 
+module "web_server_sg" {
+  source = "terraform-aws-modules/security-group/aws//modules/http-80"
+
+  name        = "web-server"
+  description = "Security group for web-server with HTTP ports open within VPC"
+  vpc_id      = module.vpc.vpc_id
+
+  ingress_cidr_blocks = [var.vpc_cidr]
+}
+
+module "alb_sg" {
+  source = "terraform-aws-modules/security-group/aws//modules/http-80"
+
+  name        = "alb"
+  description = "Security group for alb with HTTP ports open to all"
+  vpc_id      = module.vpc.vpc_id
+
+  ingress_cidr_blocks = ["0.0.0.0/0"]
+}
+
 ## Load Balancer
 module "alb" {
   source  = "terraform-aws-modules/alb/aws"
@@ -50,7 +71,7 @@ module "alb" {
 
   vpc_id             = module.vpc.vpc_id
   subnets            = module.vpc.public_subnets
-  security_groups    = [module.vpc.default_security_group_id]
+  security_groups    = [module.alb_sg.security_group_id]
 
   target_groups = [
     {
@@ -84,7 +105,7 @@ module "asg" {
 
   min_size                  = 0
   max_size                  = 3
-  desired_capacity          = 1
+  desired_capacity          = 2
   wait_for_capacity_timeout = 0
   health_check_type         = "EC2"
   vpc_zone_identifier       = module.vpc.private_subnets[*]
@@ -131,6 +152,7 @@ module "asg" {
     http_put_response_hop_limit = 32
   }
 
+  security_groups = [module.web_server_sg.security_group_id]
   target_group_arns = module.alb.target_group_arns
   key_name = "myNginxInstance"
   user_data_base64 = base64encode(local.instance_user_data)
