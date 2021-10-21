@@ -14,12 +14,8 @@ provider "aws" {
 locals {
   instance_user_data = <<EOF
 #!/bin/bash
-sudo amazon-linux-extras install -y docker
-sudo systemctl enable docker
-sudo systemctl start docker
-sudo usermod -a -G docker ec2-user
-docker run -p 80:80 --name my-nginx -d nginx
-docker exec my-nginx sed -i "s/to nginx/to $HOSTNAME/" usr/share/nginx/html/index.html
+echo ECS_CLUSTER=example > /etc/ecs/ecs.config
+rm -f /var/lib/ecs/data/agent.db
 EOF
 }
 
@@ -95,7 +91,11 @@ module "alb" {
   }
 }
 
-## Autoscaling
+resource "aws_iam_instance_profile" "ecs_register" {
+  name = "ecs_register"
+  role = "AmazonEC2ContainerServiceforEC2Role"
+}
+
 module "asg" {
   source  = "terraform-aws-modules/autoscaling/aws"
   version = "~> 4.7"
@@ -103,12 +103,14 @@ module "asg" {
   # Autoscaling group
   name = "example-asg"
 
+
   min_size                  = 0
   max_size                  = 3
   desired_capacity          = 2
   wait_for_capacity_timeout = 0
   health_check_type         = "EC2"
   vpc_zone_identifier       = module.vpc.private_subnets[*]
+  #protect_from_scale_in     = true
 
   initial_lifecycle_hooks = [
     {
@@ -135,6 +137,7 @@ module "asg" {
     triggers = ["tag"]
   }
 
+
   # Launch template
   lt_name                = "example-asg"
   description            = "Launch template example"
@@ -152,9 +155,130 @@ module "asg" {
     http_put_response_hop_limit = 32
   }
 
+  iam_instance_profile_arn = aws_iam_instance_profile.ecs_register.arn
   security_groups = [module.web_server_sg.security_group_id]
   target_group_arns = module.alb.target_group_arns
   key_name = "myNginxInstance"
   user_data_base64 = base64encode(local.instance_user_data)
 
+   tags =[
+    {
+      key                 = "AmazonECSManaged"
+      value               = ""
+      propagate_at_launch = true
+    }
+   ]
+
+}
+
+resource "aws_ecs_capacity_provider" "autoscaling_ec2_capacity" {
+  name = "tetris-asg-capacity"
+
+  auto_scaling_group_provider {
+    auto_scaling_group_arn         = module.asg.autoscaling_group_arn
+
+    managed_scaling {
+      maximum_scaling_step_size = 1
+      minimum_scaling_step_size = 1
+      status                    = "ENABLED"
+      target_capacity           = 2
+    }
+  }
+}
+
+resource "aws_iam_service_linked_role" "AWSServiceRoleForECS" {
+  aws_service_name = "ecs.amazonaws.com"
+}
+
+resource "aws_kms_key" "example" {
+  description             = "example"
+  deletion_window_in_days = 7
+}
+
+resource "aws_cloudwatch_log_group" "example" {
+  name = "example"
+}
+
+resource "aws_ecs_cluster" "test" {
+  name = "example"
+  capacity_providers = [aws_ecs_capacity_provider.autoscaling_ec2_capacity.name]
+
+  configuration {
+    execute_command_configuration {
+      kms_key_id = aws_kms_key.example.arn
+      logging    = "OVERRIDE"
+
+      log_configuration {
+        cloud_watch_encryption_enabled = true
+        cloud_watch_log_group_name     = aws_cloudwatch_log_group.example.name
+      }
+    }
+  }
+}
+
+resource "aws_ecs_task_definition" "tetris-task" {
+  family = "service"
+  container_definitions = jsonencode([
+    {
+      name      = "tetris"
+      image     = "572248248342.dkr.ecr.eu-central-1.amazonaws.com/testing-ecs:latest"
+      cpu       = 10
+      memory    = 512
+      essential = true
+      portMappings = [
+        {
+          containerPort = 80
+          hostPort      = 80
+        }
+      ]
+    }
+  ])
+
+}
+
+resource "aws_ecs_service" "tetris" {
+  name            = "tetris-service"
+  cluster         = aws_ecs_cluster.test.id
+  task_definition = aws_ecs_task_definition.tetris-task.arn
+  desired_count   = 3
+
+  ordered_placement_strategy {
+    type  = "binpack"
+    field = "cpu"
+  }
+}
+
+resource "aws_security_group" "bastion_sg" {
+  count = var.create_bastion == true ? 1 : 0
+  name        = "SSH"
+  vpc_id      = module.vpc.vpc_id
+
+  ingress {
+      from_port        = 22
+      to_port          = 22
+      protocol         = "tcp"
+      cidr_blocks      = ["0.0.0.0/0"]
+    }
+
+  egress {
+      from_port        = 0
+      to_port          = 0
+      protocol         = "-1"
+      cidr_blocks      = ["0.0.0.0/0"]
+    }
+
+}
+
+resource "aws_instance" "bastion" {
+  count = var.create_bastion == true ? 1 : 0
+  ami = "ami-058e6df85cfc7760b"
+  instance_type = "t2.micro"
+  subnet_id = module.vpc.public_subnets[0]
+  associate_public_ip_address = true
+  security_groups = [aws_security_group.bastion_sg[0].name]
+
+  tags = {
+    Name = "Bastion"
+  }
+  key_name = "myNginxInstance"
 }
