@@ -46,7 +46,7 @@ variable "alb_name" {
 
 variable "image_id" {
   type = string
-  default = "ami-058e6df85cfc7760b"
+  default = "ami-06a0b593202c1590d"
 }
 variable "vpc_tags" {
   description = "Tags to apply to resources created by VPC module"
@@ -55,4 +55,9 @@ variable "vpc_tags" {
     Terraform   = "true"
     Environment = "dev"
   }
+}
+
+variable "create_bastion" {
+  type = bool
+  default = true
 }
